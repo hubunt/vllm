@@ -83,6 +83,15 @@ if GDN_AITER_TRITON_AVAILABLE:
 logger = init_logger(__name__)
 
 
+def _get_gdn_prefill_warmup_seq_lens(
+    backend: str,
+) -> tuple[tuple[int, ...], ...]:
+    seq_lens = ((FLA_CHUNK_SIZE,),)
+    if backend == "cutedsl":
+        seq_lens += ((1,) * 8,)
+    return seq_lens
+
+
 # TODO(arpera): remove ``_is_libs_cu13_install_intact`` and its caller in
 # ``_resolve_gdn_prefill_backend`` once the upstream packaging bug is
 # fixed and the broken wheels are yanked / superseded on PyPI:
@@ -1083,8 +1092,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         actual benchmarking cost.
 
         All kernels including ``chunk_fwd_kernel_o`` now use a fixed
-        ``BT = chunk_size`` (64).  A single warmup pass with T = 64
-        is sufficient to populate the autotuner cache.
+        ``BT = chunk_size`` (64), so the FLA/Triton autotuner is covered by
+        a single chunk-sized pass.  CuteDSL additionally specializes on
+        metadata shapes, so it also warms a small multi-sequence prefill
+        shape used by large-to-small request transitions.
 
         The decode path uses ``gdn_aiter_fused_rearrange_sigmoid_gated_delta_rule``
         which has fixed kernel parameters (no autotuning), so only the
@@ -1100,97 +1111,106 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         num_v_heads = self.num_v_heads // self.tp_size
         _, state_dtype = self.get_state_dtype()
 
-        # All kernels use BT = chunk_size, so a single pass with T = chunk_size
-        # is sufficient to populate every autotuner cache. Mirror the real
-        # prefill path here: build q/k/v/g/beta via fused_post_conv_prep and
-        # then run chunk_gated_delta_rule with in-kernel L2 norm disabled.
-        T = FLA_CHUNK_SIZE
-        dummy_mixed_qkv = torch.randn(
-            T, qkv_or_qkvz.shape[-1] - v_dim, device=device, dtype=dtype
-        )
-        dummy_a = torch.randn(T, num_v_heads, device=device, dtype=dtype)
-        dummy_b = torch.randn(T, num_v_heads, device=device, dtype=dtype)
-        q, k, v, g, beta = fused_post_conv_prep(
-            conv_output=dummy_mixed_qkv,
-            a=dummy_a,
-            b=dummy_b,
-            A_log=self.A_log,
-            dt_bias=self.dt_bias,
-            num_k_heads=num_k_heads,
-            head_k_dim=self.head_k_dim,
-            head_v_dim=self.head_v_dim,
-            apply_l2norm=True,
-            output_g_exp=False,
-        )
-        q = q.unsqueeze(0)
-        k = k.unsqueeze(0)
-        v = v.unsqueeze(0)
-        g = g.unsqueeze(0)
-        beta = beta.unsqueeze(0)
-        state = torch.zeros(
-            1,
-            num_v_heads,
-            self.head_v_dim,
-            self.head_k_dim,
-            device=device,
-            dtype=state_dtype,
-        )
-        cu_seqlens = torch.tensor([0, T], device=device, dtype=torch.int32)
-
-        # CuteDSL kernels require metadata
-        chunk_indices = None
-        chunk_offsets = None
-        if self.gdn_prefill_backend == "cutedsl":
-            from vllm.model_executor.layers.mamba.ops.gdn_chunk_cutedsl import (
-                prepare_metadata_cutedsl,
+        for seq_lens in _get_gdn_prefill_warmup_seq_lens(self.gdn_prefill_backend):
+            # Mirror the real prefill path here: build q/k/v/g/beta via
+            # fused_post_conv_prep and then run chunk_gated_delta_rule with
+            # in-kernel L2 norm disabled.
+            T = sum(seq_lens)
+            dummy_mixed_qkv = torch.randn(
+                T, qkv_or_qkvz.shape[-1] - v_dim, device=device, dtype=dtype
+            )
+            dummy_a = torch.randn(T, num_v_heads, device=device, dtype=dtype)
+            dummy_b = torch.randn(T, num_v_heads, device=device, dtype=dtype)
+            q, k, v, g, beta = fused_post_conv_prep(
+                conv_output=dummy_mixed_qkv,
+                a=dummy_a,
+                b=dummy_b,
+                A_log=self.A_log,
+                dt_bias=self.dt_bias,
+                num_k_heads=num_k_heads,
+                head_k_dim=self.head_k_dim,
+                head_v_dim=self.head_v_dim,
+                apply_l2norm=True,
+                output_g_exp=False,
+            )
+            q = q.unsqueeze(0)
+            k = k.unsqueeze(0)
+            v = v.unsqueeze(0)
+            g = g.unsqueeze(0)
+            beta = beta.unsqueeze(0)
+            state = torch.zeros(
+                len(seq_lens),
+                num_v_heads,
+                self.head_v_dim,
+                self.head_k_dim,
+                device=device,
+                dtype=state_dtype,
+            )
+            cu_seqlens_list = [0]
+            for seq_len in seq_lens:
+                cu_seqlens_list.append(cu_seqlens_list[-1] + seq_len)
+            cu_seqlens = torch.tensor(
+                cu_seqlens_list,
+                device=device,
+                dtype=torch.int32,
             )
 
-            chunk_indices, chunk_offsets = prepare_metadata_cutedsl(cu_seqlens, T)
+            # CuteDSL kernels require metadata.
+            chunk_indices = None
+            chunk_offsets = None
+            if self.gdn_prefill_backend == "cutedsl":
+                from vllm.model_executor.layers.mamba.ops.gdn_chunk_cutedsl import (
+                    prepare_metadata_cutedsl,
+                )
 
-        try:
-            self.chunk_gated_delta_rule(
-                q=q,
-                k=k,
-                v=v,
-                g=g,
-                beta=beta,
-                initial_state=state,
-                output_final_state=True,
-                cu_seqlens=cu_seqlens,
-                chunk_indices=chunk_indices,
-                chunk_offsets=chunk_offsets,
-                use_qk_l2norm_in_kernel=False,
-            )
-        except Exception:
-            logger.warning(
-                "GDN prefill kernel warmup (T=%d) failed for "
-                "layer %s. First inference may OOM due to "
-                "autotuner.",
-                T,
-                self.prefix,
-                exc_info=True,
-            )
-        else:
-            logger.debug(
-                "GDN prefill kernel warmup (T=%d) completed for layer %s",
-                T,
-                self.prefix,
-            )
-        finally:
-            del (
-                dummy_mixed_qkv,
-                q,
-                k,
-                v,
-                dummy_a,
-                dummy_b,
-                g,
-                beta,
-                state,
-                cu_seqlens,
-                chunk_indices,
-                chunk_offsets,
-            )
+                chunk_indices, chunk_offsets = prepare_metadata_cutedsl(cu_seqlens, T)
+
+            try:
+                self.chunk_gated_delta_rule(
+                    q=q,
+                    k=k,
+                    v=v,
+                    g=g,
+                    beta=beta,
+                    initial_state=state,
+                    output_final_state=True,
+                    cu_seqlens=cu_seqlens,
+                    chunk_indices=chunk_indices,
+                    chunk_offsets=chunk_offsets,
+                    use_qk_l2norm_in_kernel=False,
+                )
+            except Exception:
+                logger.warning(
+                    "GDN prefill kernel warmup (T=%d, num_seqs=%d) failed for "
+                    "layer %s. First inference may OOM or stall due to JIT.",
+                    T,
+                    len(seq_lens),
+                    self.prefix,
+                    exc_info=True,
+                )
+            else:
+                logger.debug(
+                    "GDN prefill kernel warmup (T=%d, num_seqs=%d) completed "
+                    "for layer %s",
+                    T,
+                    len(seq_lens),
+                    self.prefix,
+                )
+            finally:
+                del (
+                    dummy_mixed_qkv,
+                    q,
+                    k,
+                    v,
+                    dummy_a,
+                    dummy_b,
+                    g,
+                    beta,
+                    state,
+                    cu_seqlens,
+                    chunk_indices,
+                    chunk_offsets,
+                )
 
         torch.accelerator.empty_cache()
 
