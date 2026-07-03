@@ -59,6 +59,7 @@ from vllm.platforms import current_platform
 from vllm.tokenizers import get_tokenizer
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.utils.mem_constants import GB_bytes
+from vllm.utils.platform_utils import cuda_is_initialized, xpu_is_initialized
 from vllm.utils.network_utils import get_open_port
 from vllm.utils.torch_utils import (
     set_random_seed,  # noqa: F401 - re-exported for use in test files
@@ -193,7 +194,12 @@ def _temporarily_sanitized_pythonpath_env():
 
 def requires_spawn_multiprocessing() -> bool:
     """Whether this platform requires spawn instead of fork for test processes."""
-    return current_platform.is_rocm() or current_platform.is_xpu()
+    return (
+        current_platform.is_rocm()
+        or current_platform.is_xpu()
+        or cuda_is_initialized()
+        or xpu_is_initialized()
+    )
 
 
 def _run_in_new_process_group(
@@ -1898,7 +1904,26 @@ def create_new_process_for_each_test(
         A decorator to run test functions in separate processes.
     """
     if method is None:
-        method = "spawn" if requires_spawn_multiprocessing() else "fork"
+
+        def dynamic_new_process_for_each_test(
+            func: Callable[_P, None],
+        ) -> Callable[_P, None]:
+
+            @functools.wraps(func)
+            def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> None:
+                if os.environ.get(_SPAWN_CHILD_ENV) == "1":
+                    return func(*args, **kwargs)
+
+                decorator = (
+                    spawn_new_process_for_each_test
+                    if requires_spawn_multiprocessing()
+                    else fork_new_process_for_each_test
+                )
+                return decorator(func)(*args, **kwargs)
+
+            return wrapper
+
+        return dynamic_new_process_for_each_test
 
     assert method in ["spawn", "fork"], "Method must be either 'spawn' or 'fork'"
 
